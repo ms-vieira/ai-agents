@@ -1,7 +1,9 @@
 import anyio
 from fastapi.testclient import TestClient
 
-from carga.load import load_session
+from settings import app_load
+
+load_session = app_load("app-payments").load_session
 from mcp_servers.tools import build_payments_server, fetch_json
 from replica.api import create_read_app
 

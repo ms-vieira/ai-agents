@@ -4,7 +4,7 @@ from pathlib import Path
 import uvicorn
 from fastapi import FastAPI, Header, HTTPException
 
-from carga.load import read_manifest
+from contracts.manifest import read_manifest
 from contracts.models import GatewayCall, GatewayResult
 from gateway.mcp_client import call_mcp_tool_sync
 from gateway.policy import GatewayPolicy

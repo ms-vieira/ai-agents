@@ -4,7 +4,9 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from agents.payments import create_app as create_payments_agent
-from carga.load import load_session
+from settings import app_load
+
+load_session = app_load("app-payments").load_session
 from contracts.models import AnomalyArtifact, SpecialistArtifact
 from orchestrator.loop import answer_question
 

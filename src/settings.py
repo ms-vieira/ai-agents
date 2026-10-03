@@ -37,6 +37,18 @@ ALLOWLIST = {
 }
 
 
+def app_load(folder: str):
+    import importlib.util
+
+    path = ROOT / folder / "load.py"
+    spec = importlib.util.spec_from_file_location(folder.replace("-", "_") + "_load", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"could not load {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def carga_seed() -> int | None:
     raw = os.environ.get("CARGA_SEED", "").strip()
     if raw == "":

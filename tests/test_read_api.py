@@ -2,7 +2,9 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from carga.load import load_session
+from settings import app_load
+
+load_session = app_load("app-payments").load_session
 from replica.api import create_read_app
 from settings import REPLICA_ONLY
 

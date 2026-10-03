@@ -14,15 +14,14 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from carga.load import load_session
-from settings import VAR, carga_seed
+from settings import VAR, app_load, carga_seed
 
 
 def main() -> None:
     payments_db = VAR / "payments.sqlite"
     reconciliation_db = VAR / "reconciliation.sqlite"
     manifest_path = VAR / "session.json"
-    manifest = load_session(
+    manifest = app_load("app-payments").load_session(
         payments_db,
         reconciliation_db,
         manifest_path,
@@ -36,8 +35,8 @@ def main() -> None:
     env["AUDIT_LOG_PATH"] = str(VAR / "audit.jsonl")
     python = sys.executable
     commands = [
-        [python, str(ROOT / "apps/payments/main.py")],
-        [python, str(ROOT / "apps/reconciliation/main.py")],
+        [python, str(ROOT / "app-payments/main.py")],
+        [python, str(ROOT / "app-reconciliation/main.py")],
         [python, "-m", "mcp_servers.payments"],
         [python, "-m", "mcp_servers.reconciliation"],
         [python, "-m", "gateway.app"],

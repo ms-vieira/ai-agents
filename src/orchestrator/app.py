@@ -5,7 +5,7 @@ import uvicorn
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-from carga.load import read_manifest
+from contracts.manifest import read_manifest
 from orchestrator.loop import HttpAgentDirectory, answer_question
 from settings import (
     ANOMALY_AGENT_PORT,
