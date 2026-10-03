@@ -170,7 +170,11 @@ def _parecer(
         answer=answer,
         payments_status=payment_status,
         reconciliation_status=reconciliation_status,
-        anomaly=anomaly.anomaly,
+        payments_outcome=anomaly.payments_outcome,
+        reconciliation_outcome=anomaly.reconciliation_outcome,
+        conclusion=anomaly.conclusion,
+        anomaly=anomaly.conclusion == "divergence",
+        codes=list(anomaly.codes),
         sources=[
             SourceRef(domain="payments", source="replica", as_of=payments.as_of),
             SourceRef(domain="reconciliation", source="replica", as_of=reconciliation.as_of),
@@ -202,7 +206,7 @@ def _compose_answer(
         parts.append(f"Status de pagamento: {payment_status}.")
     if reconciliation_status:
         parts.append(f"Status de conciliação: {reconciliation_status}.")
-    if anomaly.anomaly:
+    if anomaly.conclusion == "divergence":
         parts.append(f"Anomalia: {', '.join(anomaly.codes)}. {anomaly.explanation}")
     else:
         parts.append(anomaly.explanation)

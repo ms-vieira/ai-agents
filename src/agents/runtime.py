@@ -1,6 +1,7 @@
 """Cartão A2A servido pelo SDK e execução local da tarefa, com uma chamada autorizada."""
 
 import os
+from datetime import date
 
 import httpx
 from a2a.server.routes.agent_card_routes import create_agent_card_routes
@@ -96,9 +97,11 @@ def run_domain_task(
     )
     _status, result = gateway.call(call)
     if result.decision == "rate_limited":
-        return _refused(agent_id, task, "Limite de chamadas atingido. A ferramenta não foi tentada de novo.")
+        return _stopped(agent_id, task, "refused", "Limite de chamadas atingido. A ferramenta não foi tentada de novo.")
+    if result.decision == "downstream_failed":
+        return _stopped(agent_id, task, "unavailable", "A consulta ficou indisponível. A ferramenta não foi concluída.")
     if result.decision not in {"allowed", "replayed"} or result.data is None:
-        return _refused(agent_id, task, result.detail or "A consulta foi recusada pelo gateway.")
+        return _stopped(agent_id, task, "refused", result.detail or "A consulta foi recusada pelo gateway.")
     template = _domain_summary(agent_id, result.data)
     summary = complete(
         SPECIALIST_MODEL,
@@ -120,8 +123,18 @@ def run_domain_task(
 
 
 def run_anomaly_task(task: AnomalyTask) -> AnomalyArtifact:
-    codes, anomaly = _codes(task.payments.data, task.reconciliation.data)
-    explanation = _explanation(task.customer_id, codes, anomaly)
+    payments_outcome = _technical_outcome(task.payments, task.customer_id, task.business_date)
+    reconciliation_outcome = _technical_outcome(task.reconciliation, task.customer_id, task.business_date)
+    codes, conclusion = _conclusion(
+        task.customer_id,
+        task.business_date,
+        payments_outcome,
+        reconciliation_outcome,
+        task.payments.data,
+        task.reconciliation.data,
+    )
+    anomaly = conclusion == "divergence"
+    explanation = _explanation(task.customer_id, codes, conclusion)
     rewritten = complete(
         SPECIALIST_MODEL,
         "Explique a divergência em português, curto, sem inventar status, valor ou customer.",
@@ -132,18 +145,21 @@ def run_anomaly_task(task: AnomalyTask) -> AnomalyArtifact:
         trace_id=task.trace_id,
         customer_id=task.customer_id,
         business_date=task.business_date,
+        payments_outcome=payments_outcome,
+        reconciliation_outcome=reconciliation_outcome,
+        conclusion=conclusion,
         anomaly=anomaly,
         codes=codes,
         explanation=rewritten or explanation,
     )
 
 
-def _refused(agent_id: str, task: DomainTask, summary: str) -> SpecialistArtifact:
+def _stopped(agent_id: str, task: DomainTask, status: str, summary: str) -> SpecialistArtifact:
     return SpecialistArtifact(
         task_id=task.task_id,
         trace_id=task.trace_id,
         agent_id=agent_id,
-        status="refused",
+        status=status,
         customer_id=task.input.customer_id,
         business_date=task.input.business_date,
         summary=summary,
@@ -170,31 +186,115 @@ def _domain_summary(agent_id: str, data: dict) -> str:
     )
 
 
-def _codes(payments: dict | None, reconciliation: dict | None) -> tuple[list[str], bool]:
+def _technical_outcome(artifact: SpecialistArtifact, customer_id: str, business_date: date) -> str:
+    if artifact.status == "refused":
+        return "refused"
+    if artifact.status != "completed" or artifact.data is None:
+        return "unavailable"
+    if _identity_mismatch(artifact.data, customer_id, business_date):
+        return "invalid"
+    return "completed"
+
+
+def _identity_mismatch(data: dict, customer_id: str, business_date: date) -> bool:
+    if data.get("customer_id") != customer_id:
+        return True
+    return str(data.get("business_date")) != business_date.isoformat()
+
+
+def _conclusion(
+    customer_id: str,
+    business_date: date,
+    payments_outcome: str,
+    reconciliation_outcome: str,
+    payments: dict | None,
+    reconciliation: dict | None,
+) -> tuple[list[str], str]:
+    if payments_outcome != "completed" or reconciliation_outcome != "completed":
+        return [], "inconclusive"
     payments = payments or {}
     reconciliation = reconciliation or {}
+    if _identity_mismatch(payments, customer_id, business_date) or _identity_mismatch(
+        reconciliation, customer_id, business_date
+    ):
+        return [], "inconclusive"
     payment = payments.get("payment") or {}
     recon = reconciliation.get("reconciliation") or {}
+    payment_found = bool(payments.get("found"))
+    recon_found = bool(reconciliation.get("found"))
+    if not payment_found and not recon_found:
+        return [], "inconclusive"
+    codes: list[str] = []
+    if payment_found and not recon_found:
+        codes.append("RECONCILIATION_MISSING")
+    if recon_found and not payment_found:
+        codes.append("PAYMENT_MISSING")
+    if payment_found and recon_found:
+        codes.extend(_record_codes(payment, recon))
+    if codes:
+        return codes, "divergence"
+    if _aligned(payment, recon):
+        return [], "no_divergence"
+    return [], "inconclusive"
+
+
+def _record_codes(payment: dict, recon: dict) -> list[str]:
     codes: list[str] = []
     payment_status = payment.get("status")
     recon_status = recon.get("status")
-    if payments.get("found") and reconciliation.get("found") and payment_status == "SUCCESS" and recon_status == "ERROR":
+    payment_id = payment.get("payment_id")
+    recon_payment_id = recon.get("payment_id")
+    if payment_status == "SUCCESS" and recon_status == "ERROR":
         codes.append("PAYMENT_SUCCESS_RECONCILIATION_ERROR")
-    anomaly_code = recon.get("anomaly_code")
-    if anomaly_code and anomaly_code not in codes:
-        codes.append(anomaly_code)
-    if payments.get("found") and not reconciliation.get("found"):
-        codes.append("RECONCILIATION_MISSING")
-    if reconciliation.get("found") and not payments.get("found"):
-        codes.append("PAYMENT_MISSING")
-    coherent_failure = payment_status == "FAILED" and recon_status == "PENDING"
-    anomaly = bool(codes) and not coherent_failure
-    if coherent_failure:
-        return [], False
-    return codes, anomaly
+    if payment_id and recon_payment_id and payment_id != recon_payment_id:
+        codes.append("PAYMENT_ID_MISMATCH")
+    if _amounts_mismatch(payment, recon):
+        codes.append("AMOUNT_MISMATCH")
+    return codes
 
 
-def _explanation(customer_id: str, codes: list[str], anomaly: bool) -> str:
-    if not anomaly:
+def _amounts_mismatch(payment: dict, recon: dict) -> bool:
+    payment_amount = payment.get("amount_cents")
+    expected = recon.get("expected_amount_cents")
+    settled = recon.get("settled_amount_cents")
+    pairs = (
+        (payment_amount, expected),
+        (payment_amount, settled),
+        (expected, settled),
+    )
+    return any(left is not None and right is not None and left != right for left, right in pairs)
+
+
+def _aligned(payment: dict, recon: dict) -> bool:
+    payment_status = payment.get("status")
+    recon_status = recon.get("status")
+    payment_id = payment.get("payment_id")
+    recon_payment_id = recon.get("payment_id")
+    if not payment_id or payment_id != recon_payment_id:
+        return False
+    payment_amount = payment.get("amount_cents")
+    expected = recon.get("expected_amount_cents")
+    settled = recon.get("settled_amount_cents")
+    if payment_status == "SUCCESS" and recon_status == "UPDATED":
+        return (
+            payment_amount is not None
+            and expected is not None
+            and settled is not None
+            and payment_amount == expected == settled
+        )
+    if payment_status == "FAILED" and recon_status == "PENDING":
+        if payment_amount is None or expected is None or payment_amount != expected:
+            return False
+        return settled is None or settled == expected
+    return False
+
+
+def _explanation(customer_id: str, codes: list[str], conclusion: str) -> str:
+    if conclusion == "inconclusive":
+        return (
+            f"A consulta de {customer_id} está inconclusiva: "
+            "a evidência foi recusada, está indisponível ou é inválida."
+        )
+    if conclusion == "no_divergence":
         return f"Os dois domínios não divergem para {customer_id}."
     return f"Há divergência para {customer_id}: {', '.join(codes)}."

@@ -8,13 +8,17 @@ BUSINESS_DATE = date(2026, 9, 30)
 
 PaymentStatus = Literal["SUCCESS", "FAILED", "NOT_PROCESSED"]
 ReconciliationStatus = Literal["UPDATED", "ERROR", "PENDING"]
-SpecialistStatus = Literal["completed", "partial", "refused"]
+SpecialistStatus = Literal["completed", "partial", "refused", "unavailable"]
+TechnicalOutcome = Literal["completed", "refused", "unavailable", "invalid"]
+BusinessConclusion = Literal["divergence", "no_divergence", "inconclusive"]
 GatewayDecision = Literal[
     "allowed",
     "denied_allowlist",
     "denied_customer_mismatch",
     "denied_customer_not_in_catalog",
     "denied_missing_customer",
+    "denied_authentication",
+    "downstream_failed",
     "rate_limited",
     "budget_exhausted",
     "replayed",
@@ -136,6 +140,9 @@ class AnomalyArtifact(BaseModel):
     agent_id: Literal["anomaly"] = "anomaly"
     customer_id: str
     business_date: date
+    payments_outcome: TechnicalOutcome
+    reconciliation_outcome: TechnicalOutcome
+    conclusion: BusinessConclusion
     anomaly: bool
     codes: list[str]
     explanation: str
@@ -154,7 +161,11 @@ class Parecer(BaseModel):
     answer: str
     payments_status: str | None
     reconciliation_status: str | None
+    payments_outcome: TechnicalOutcome
+    reconciliation_outcome: TechnicalOutcome
+    conclusion: BusinessConclusion
     anomaly: bool
+    codes: list[str]
     sources: list[SourceRef]
 
 

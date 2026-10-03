@@ -55,7 +55,7 @@ Without `OPENAI_API_KEY`, the answer text is filled from the replica JSON. With 
 | `src/gateway/` | Allowlist, rate limit, call budget, redaction, audit log |
 | `src/agents/` | `payments`, `reconciliation`, and `anomaly` |
 | `src/orchestrator/` | Catalog, refusal, and the parecer |
-| `src/contracts/` | Shared JSON. Includes the manifest reader |
+| `src/contracts/` | Shared JSON. The parecer separates technical outcome from the business conclusion. See [src/contracts/README.md](src/contracts/README.md). |
 | `src/replica/` | Read routes used by both apps |
 | `tests/` | Permissions, replica, rate limit, and redaction, with no model call |
 | `article/article.md` | Portuguese walkthrough of the same path |

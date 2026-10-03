@@ -1,6 +1,7 @@
 """Autoriza a chamada de ferramenta antes de qualquer ida à API de leitura."""
 
 import json
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -39,7 +40,7 @@ class GatewayPolicy:
         *,
         now: float | None = None,
     ) -> tuple[int, GatewayResult]:
-        clock = 0.0 if now is None else now
+        clock = time.monotonic() if now is None else now
         started = datetime.now(timezone.utc)
         decision, data, detail = self._decide(agent_id, call, downstream, clock)
         result = GatewayResult(decision=decision, data=data, detail=detail)
@@ -85,7 +86,10 @@ class GatewayPolicy:
         if not self._take_token((agent_id, call.tool), now):
             return "rate_limited", None, "limite de chamadas por minuto"
 
-        raw = downstream(call.tool, arguments.model_dump(mode="json"))
+        try:
+            raw = downstream(call.tool, arguments.model_dump(mode="json"))
+        except Exception:
+            return "downstream_failed", None, "a ferramenta não respondeu"
         redacted = redact_payload(raw) or {}
         self._cache[replay_key] = redacted
         self._counts[budget_key] = self._counts.get(budget_key, 0) + 1
@@ -123,11 +127,31 @@ class GatewayPolicy:
             handle.write(line.model_dump_json() + "\n")
 
 
+def audit_authentication_refusal(audit_path: Path, call: GatewayCall) -> None:
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
+    line = AuditLine(
+        trace_id=call.trace_id,
+        task_id=call.task_id,
+        agent_id="unknown",
+        model=call.model,
+        tool=call.tool,
+        customer_id=call.task_customer_id,
+        decision="denied_authentication",
+        latency_ms=0,
+        at=datetime.now(timezone.utc),
+        redacted_text=None,
+    )
+    with audit_path.open("a", encoding="utf-8") as handle:
+        handle.write(line.model_dump_json() + "\n")
+
+
 def _status_for(decision: str) -> int:
     if decision in {"allowed", "replayed"}:
         return 200
     if decision == "rate_limited":
         return 429
+    if decision == "downstream_failed":
+        return 503
     return 403
 
 
