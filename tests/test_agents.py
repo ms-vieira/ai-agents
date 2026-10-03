@@ -22,7 +22,8 @@ class CountingGateway:
                 "as_of": "2026-09-30T21:00:00Z",
                 "found": True,
                 "customer_id": body.task_customer_id,
-                "payment": {"payment_id": "pay_1", "status": "SUCCESS"},
+                "business_date": "2026-09-30",
+                "payment": {"payment_id": "pay_1", "status": "SUCCESS", "amount_cents": 100_000},
             },
         )
 
@@ -154,7 +155,7 @@ def test_provedor_indisponivel_mantem_o_resumo_da_evidencia(monkeypatch) -> None
     assert "sk_live_provider_key" not in artifact.summary
 
 
-def test_falha_e_pendencia_com_o_mesmo_valor_nao_divergem() -> None:
+def test_falha_e_pendencia_sem_valor_liquidado_fica_inconclusiva() -> None:
     task = AnomalyTask(
         task_id="a",
         trace_id="t",
@@ -167,8 +168,9 @@ def test_falha_e_pendencia_com_o_mesmo_valor_nao_divergem() -> None:
         ),
     )
     result = run_anomaly_task(task)
-    assert result.conclusion == "no_divergence"
+    assert result.conclusion == "inconclusive"
     assert result.codes == []
+    assert "não divergem" not in result.explanation
 
 
 def _artifact(agent_id: str, data: dict | None, status: str = "completed") -> SpecialistArtifact:
@@ -187,6 +189,8 @@ def _artifact(agent_id: str, data: dict | None, status: str = "completed") -> Sp
 
 def _payment_data(status: str, amount_cents: int, payment_id: str = "pay_1") -> dict:
     return {
+        "source": "replica",
+        "as_of": "2026-09-30T21:00:00Z",
         "found": True,
         "customer_id": "C-4821",
         "business_date": "2026-09-30",
@@ -202,10 +206,13 @@ def _reconciliation_data(
     anomaly_code: str | None = None,
 ) -> dict:
     return {
+        "source": "replica",
+        "as_of": "2026-09-30T21:00:00Z",
         "found": True,
         "customer_id": "C-4821",
         "business_date": "2026-09-30",
         "reconciliation": {
+            "reconciliation_id": "rec_1",
             "status": status,
             "payment_id": payment_id,
             "expected_amount_cents": expected_amount_cents,

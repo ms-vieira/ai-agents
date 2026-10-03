@@ -35,7 +35,14 @@ class ScriptedAgents:
             customer_id=task.input.customer_id,
             business_date=task.input.business_date,
             summary="Pagamento com sucesso na réplica.",
-            data={"found": True, "source": "replica", "payment": {"status": "SUCCESS", "payment_id": "pay_1"}},
+            data={
+                "source": "replica",
+                "as_of": "2026-09-30T21:00:00Z",
+                "found": True,
+                "customer_id": task.input.customer_id,
+                "business_date": task.input.business_date.isoformat(),
+                "payment": {"status": "SUCCESS", "payment_id": "pay_1", "amount_cents": 100_000},
+            },
         )
 
     def reconciliation(self, task) -> SpecialistArtifact:
@@ -49,9 +56,19 @@ class ScriptedAgents:
             business_date=task.input.business_date,
             summary="Conciliação em erro na réplica.",
             data={
-                "found": True,
                 "source": "replica",
-                "reconciliation": {"status": "ERROR", "anomaly_code": "AMOUNT_MISMATCH", "reconciliation_id": "rec_1"},
+                "as_of": "2026-09-30T21:00:00Z",
+                "found": True,
+                "customer_id": task.input.customer_id,
+                "business_date": task.input.business_date.isoformat(),
+                "reconciliation": {
+                    "status": "ERROR",
+                    "anomaly_code": "AMOUNT_MISMATCH",
+                    "reconciliation_id": "rec_1",
+                    "payment_id": "pay_1",
+                    "expected_amount_cents": 100_000,
+                    "settled_amount_cents": 99_999,
+                },
             },
         )
 
@@ -134,10 +151,13 @@ def test_parecer_inconclusivo_preserva_codigos_quando_ha_divergencia(tmp_path: P
                 business_date=task.input.business_date,
                 summary="Conciliação atualizada na réplica.",
                 data={
+                    "source": "replica",
+                    "as_of": "2026-09-30T21:00:00Z",
                     "found": True,
                     "customer_id": task.input.customer_id,
                     "business_date": task.input.business_date.isoformat(),
                     "reconciliation": {
+                        "reconciliation_id": "rec_1",
                         "status": "UPDATED",
                         "payment_id": "pay_1",
                         "expected_amount_cents": 100_000,
@@ -154,8 +174,11 @@ def test_parecer_inconclusivo_preserva_codigos_quando_ha_divergencia(tmp_path: P
     assert parecer["conclusion"] == "inconclusive"
     assert parecer["anomaly"] is False
     assert parecer["payments_outcome"] == "refused"
+    assert parecer["reconciliation_outcome"] == "completed"
     assert "não divergem" not in parecer["answer"]
+    assert "Conciliação atualizada na réplica." in parecer["answer"]
     assert parecer["codes"] == []
+    assert [source["domain"] for source in parecer["sources"]] == ["reconciliation"]
 
 
 def test_cartao_do_agente_de_pagamentos() -> None:

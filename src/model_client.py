@@ -2,8 +2,13 @@ import os
 
 import httpx
 
+from settings import MODEL_TIMEOUT_SECONDS
 
-def complete(model: str, system: str, user: str) -> str | None:
+
+def complete(model: str, system: str, user: str, timeout: float | None = None) -> str | None:
+    limit = MODEL_TIMEOUT_SECONDS if timeout is None else timeout
+    if limit <= 0:
+        return None
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not api_key:
         return None
@@ -20,7 +25,7 @@ def complete(model: str, system: str, user: str) -> str | None:
                     {"role": "user", "content": user},
                 ],
             },
-            timeout=20,
+            timeout=limit,
         )
         response.raise_for_status()
         content = response.json()["choices"][0]["message"]["content"]

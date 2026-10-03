@@ -1,14 +1,14 @@
 from datetime import date, datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 CUSTOMER_ID_PATTERN = r"^C-\d{4}$"
 BUSINESS_DATE = date(2026, 9, 30)
 
 PaymentStatus = Literal["SUCCESS", "FAILED", "NOT_PROCESSED"]
 ReconciliationStatus = Literal["UPDATED", "ERROR", "PENDING"]
-SpecialistStatus = Literal["completed", "partial", "refused", "unavailable"]
+SpecialistStatus = Literal["completed", "partial", "refused", "unavailable", "invalid"]
 TechnicalOutcome = Literal["completed", "refused", "unavailable", "invalid"]
 BusinessConclusion = Literal["divergence", "no_divergence", "inconclusive"]
 GatewayDecision = Literal[
@@ -19,6 +19,7 @@ GatewayDecision = Literal[
     "denied_missing_customer",
     "denied_authentication",
     "downstream_failed",
+    "invalid_payload",
     "rate_limited",
     "budget_exhausted",
     "replayed",
@@ -29,7 +30,7 @@ ScenarioName = Literal["aligned", "divergence", "failed"]
 class PaymentRecord(BaseModel):
     payment_id: str
     status: PaymentStatus
-    amount_cents: int
+    amount_cents: int = Field(ge=0)
     currency: Literal["BRL"] = "BRL"
     error_code: str | None = None
     error_detail: str | None = None
@@ -44,13 +45,21 @@ class PaymentReadResponse(BaseModel):
     found: bool
     payment: PaymentRecord | None = None
 
+    @model_validator(mode="after")
+    def found_matches_record(self) -> "PaymentReadResponse":
+        if self.found and self.payment is None:
+            raise ValueError("contrato")
+        if not self.found and self.payment is not None:
+            raise ValueError("contrato")
+        return self
+
 
 class ReconciliationRecord(BaseModel):
     reconciliation_id: str
     payment_id: str | None = None
     status: ReconciliationStatus
-    expected_amount_cents: int | None = None
-    settled_amount_cents: int | None = None
+    expected_amount_cents: int | None = Field(default=None, ge=0)
+    settled_amount_cents: int | None = Field(default=None, ge=0)
     anomaly_code: str | None = None
     detail: str | None = None
 
@@ -62,6 +71,14 @@ class ReconciliationReadResponse(BaseModel):
     business_date: date
     found: bool
     reconciliation: ReconciliationRecord | None = None
+
+    @model_validator(mode="after")
+    def found_matches_record(self) -> "ReconciliationReadResponse":
+        if self.found and self.reconciliation is None:
+            raise ValueError("contrato")
+        if not self.found and self.reconciliation is not None:
+            raise ValueError("contrato")
+        return self
 
 
 class ToolArguments(BaseModel):
@@ -110,6 +127,7 @@ class DomainTask(BaseModel):
     trace_id: str
     skill: str
     input: DomainTaskInput
+    timeout_seconds: float | None = None
 
 
 class SpecialistArtifact(BaseModel):
@@ -132,6 +150,7 @@ class AnomalyTask(BaseModel):
     business_date: date
     payments: SpecialistArtifact
     reconciliation: SpecialistArtifact
+    timeout_seconds: float | None = None
 
 
 class AnomalyArtifact(BaseModel):

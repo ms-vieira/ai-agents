@@ -2,12 +2,20 @@
 
 import os
 import re
+import time
 import uuid
 from datetime import date
 
 import httpx
+from pydantic import ValidationError
 
-from model_client import complete
+from agents.evidence import (
+    consultation_line,
+    inconclusive_anomaly,
+    shareable_artifact,
+    stopped_artifact,
+    technical_outcome,
+)
 from contracts.models import (
     AnomalyArtifact,
     AnomalyTask,
@@ -19,11 +27,40 @@ from contracts.models import (
     SourceRef,
     SpecialistArtifact,
 )
-from settings import BUSINESS_DATE
+from model_client import complete
+from settings import (
+    AGENT_CALL_TIMEOUT_SECONDS,
+    BUSINESS_DATE,
+    GATEWAY_CALL_TIMEOUT_SECONDS,
+    INVESTIGATION_DEADLINE_SECONDS,
+    MODEL_TIMEOUT_SECONDS,
+    PARECER_RESERVE_SECONDS,
+)
 
 CUSTOMER_RE = re.compile(r"\bC-\d{4}\b")
 ORCHESTRATOR_MODEL = os.environ.get("ORCHESTRATOR_MODEL", "gpt-4.1")
 REPLICA_WARNING = "A leitura vem da réplica e pode estar atrás do processamento transacional."
+def _call_floor() -> float:
+    return min(AGENT_CALL_TIMEOUT_SECONDS, GATEWAY_CALL_TIMEOUT_SECONDS + 0.5)
+
+
+class Deadline:
+    def __init__(self, seconds: float, reserve: float, clock) -> None:
+        self._clock = clock
+        self._end = clock() + seconds
+        self._reserve = reserve
+
+    def budget(self) -> float | None:
+        available = self._end - self._clock() - self._reserve
+        if available < _call_floor():
+            return None
+        return available
+
+
+class _CallProblem(Exception):
+    def __init__(self, status: str, summary: str) -> None:
+        self.status = status
+        self.summary = summary
 
 
 class AgentDirectory:
@@ -38,7 +75,14 @@ class AgentDirectory:
 
 
 class HttpAgentDirectory(AgentDirectory):
-    def __init__(self, payments_url: str, reconciliation_url: str, anomaly_url: str) -> None:
+    def __init__(
+        self,
+        payments_url: str,
+        reconciliation_url: str,
+        anomaly_url: str,
+        transport: httpx.BaseTransport | None = None,
+        timeout: float | None = None,
+    ) -> None:
         self._urls = {
             "payments": payments_url.rstrip("/"),
             "reconciliation": reconciliation_url.rstrip("/"),
@@ -49,29 +93,82 @@ class HttpAgentDirectory(AgentDirectory):
             "reconciliation": "lookup_customer_reconciliation",
             "anomaly": "detect_anomaly",
         }
-        self._http = httpx.Client(timeout=10)
+        self._default_timeout = AGENT_CALL_TIMEOUT_SECONDS if timeout is None else timeout
+        self._deadline: Deadline | None = None
+        self._http = httpx.Client(timeout=self._default_timeout, transport=transport)
+
+    def bind_deadline(self, deadline: Deadline) -> None:
+        self._deadline = deadline
 
     def payments(self, task: DomainTask) -> SpecialistArtifact:
-        return SpecialistArtifact.model_validate(self._send("payments", task.model_dump(mode="json")))
+        return self._domain("payments", task)
 
     def reconciliation(self, task: DomainTask) -> SpecialistArtifact:
-        return SpecialistArtifact.model_validate(
-            self._send("reconciliation", task.model_dump(mode="json"))
-        )
+        return self._domain("reconciliation", task)
 
     def anomaly(self, task: AnomalyTask) -> AnomalyArtifact:
-        return AnomalyArtifact.model_validate(self._send("anomaly", task.model_dump(mode="json")))
+        try:
+            payload = self._send("anomaly", task.model_dump(mode="json"))
+        except _CallProblem as problem:
+            return inconclusive_anomaly(task, problem.summary)
+        try:
+            return AnomalyArtifact.model_validate(payload)
+        except ValidationError:
+            return inconclusive_anomaly(
+                task,
+                "A análise de anomalia devolveu uma resposta inválida. A conclusão fica inconclusiva.",
+            )
+
+    def _domain(self, name: str, task: DomainTask) -> SpecialistArtifact:
+        try:
+            payload = self._send(name, task.model_dump(mode="json"))
+        except _CallProblem as problem:
+            return stopped_artifact(name, task, problem.status, problem.summary)
+        try:
+            return SpecialistArtifact.model_validate(payload)
+        except ValidationError:
+            return stopped_artifact(name, task, "invalid", "A consulta não produziu evidência utilizável.")
 
     def _send(self, name: str, payload: dict) -> dict:
+        timeout = self._limit()
         base = self._urls[name]
-        card = self._http.get(f"{base}/.well-known/agent-card.json")
-        card.raise_for_status()
-        skill_ids = [skill.get("id") for skill in card.json().get("skills", [])]
+        try:
+            card = self._http.get(f"{base}/.well-known/agent-card.json", timeout=timeout)
+        except httpx.TimeoutException as exc:
+            raise _CallProblem("unavailable", "A consulta excedeu o prazo.") from exc
+        except httpx.HTTPError as exc:
+            raise _CallProblem("unavailable", "A consulta está indisponível.") from exc
+        _raise_for_status(card, "O cartão do agente")
+        try:
+            body = card.json()
+        except ValueError as exc:
+            raise _CallProblem("invalid", "O cartão do agente não é um JSON válido.") from exc
+        skills = body.get("skills", []) if isinstance(body, dict) else []
+        skill_ids = [skill.get("id") for skill in skills if isinstance(skill, dict)]
         if self._skills[name] not in skill_ids:
-            raise RuntimeError(f"o cartão de {name} não publica a skill esperada")
-        response = self._http.post(f"{base}/v1/tasks", json=payload)
-        response.raise_for_status()
-        return response.json()
+            raise _CallProblem("invalid", "O cartão do agente não publica a skill esperada.")
+        try:
+            response = self._http.post(f"{base}/v1/tasks", json=payload, timeout=timeout)
+        except httpx.TimeoutException as exc:
+            raise _CallProblem("unavailable", "A consulta excedeu o prazo.") from exc
+        except httpx.HTTPError as exc:
+            raise _CallProblem("unavailable", "A consulta está indisponível.") from exc
+        _raise_for_status(response, "A consulta")
+        try:
+            parsed = response.json()
+        except ValueError as exc:
+            raise _CallProblem("invalid", "A consulta não produziu evidência utilizável.") from exc
+        if not isinstance(parsed, dict):
+            raise _CallProblem("invalid", "A consulta não produziu evidência utilizável.")
+        return parsed
+
+    def _limit(self) -> float:
+        if self._deadline is None:
+            return self._default_timeout
+        budget = self._deadline.budget()
+        if budget is None:
+            raise _CallProblem("unavailable", "A consulta não coube no prazo da investigação.")
+        return min(self._default_timeout, budget)
 
     def close(self) -> None:
         self._http.close()
@@ -83,6 +180,8 @@ def answer_question(
     agents: AgentDirectory | None = None,
     *,
     trace_id: str | None = None,
+    clock=time.monotonic,
+    deadline_seconds: float | None = None,
 ) -> dict:
     catalog = manifest.public()
     customer_id = _customer_id(question)
@@ -105,12 +204,27 @@ def answer_question(
         raise RuntimeError("a consulta de um customer precisa dos agentes")
     trace = trace_id or str(uuid.uuid4())
     day = manifest.business_date
+    deadline = Deadline(
+        INVESTIGATION_DEADLINE_SECONDS if deadline_seconds is None else deadline_seconds,
+        PARECER_RESERVE_SECONDS,
+        clock,
+    )
+    if hasattr(agents, "bind_deadline"):
+        agents.bind_deadline(deadline)
     payments_task = _domain_task(trace, "lookup_customer_processing", customer_id, day, question)
     reconciliation_task = _domain_task(
         trace, "lookup_customer_reconciliation", customer_id, day, question
     )
-    payments = agents.payments(payments_task)
-    reconciliation = agents.reconciliation(reconciliation_task)
+    payments = shareable_artifact(
+        _invoke_domain(agents.payments, payments_task, deadline, "payments"),
+        customer_id,
+        day,
+    )
+    reconciliation = shareable_artifact(
+        _invoke_domain(agents.reconciliation, reconciliation_task, deadline, "reconciliation"),
+        customer_id,
+        day,
+    )
     anomaly_task = AnomalyTask(
         task_id=str(uuid.uuid4()),
         trace_id=trace,
@@ -119,8 +233,8 @@ def answer_question(
         payments=payments,
         reconciliation=reconciliation,
     )
-    anomaly = agents.anomaly(anomaly_task)
-    parecer = _parecer(trace, customer_id, day, payments, reconciliation, anomaly)
+    anomaly = _invoke_anomaly(agents.anomaly, anomaly_task, deadline)
+    parecer = _parecer(trace, customer_id, day, payments, reconciliation, anomaly, deadline)
     return {"kind": "parecer", "parecer": parecer.model_dump(mode="json")}
 
 
@@ -152,6 +266,61 @@ def _domain_task(trace_id: str, skill: str, customer_id: str, day: date, questio
     )
 
 
+def _invoke_domain(method, task: DomainTask, deadline: Deadline, agent_id: str) -> SpecialistArtifact:
+    budget = deadline.budget()
+    if budget is None:
+        return stopped_artifact(agent_id, task, "unavailable", "A consulta não coube no prazo da investigação.")
+    task = task.model_copy(update={"timeout_seconds": min(budget, AGENT_CALL_TIMEOUT_SECONDS)})
+    try:
+        return method(task)
+    except _CallProblem as problem:
+        return stopped_artifact(agent_id, task, problem.status, problem.summary)
+    except httpx.TimeoutException:
+        return stopped_artifact(agent_id, task, "unavailable", "A consulta excedeu o prazo.")
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code in (401, 403):
+            return stopped_artifact(agent_id, task, "refused", "A consulta foi recusada.")
+        return stopped_artifact(agent_id, task, "unavailable", "A consulta está indisponível.")
+    except httpx.HTTPError:
+        return stopped_artifact(agent_id, task, "unavailable", "A consulta está indisponível.")
+    except ValidationError:
+        return stopped_artifact(agent_id, task, "invalid", "A consulta não produziu evidência utilizável.")
+    except (ValueError, TypeError):
+        return stopped_artifact(agent_id, task, "invalid", "A consulta não produziu evidência utilizável.")
+
+
+def _invoke_anomaly(method, task: AnomalyTask, deadline: Deadline) -> AnomalyArtifact:
+    budget = deadline.budget()
+    if budget is None:
+        return inconclusive_anomaly(
+            task,
+            "A análise de anomalia não coube no prazo. A conclusão fica inconclusiva.",
+        )
+    task = task.model_copy(update={"timeout_seconds": min(budget, AGENT_CALL_TIMEOUT_SECONDS)})
+    try:
+        return method(task)
+    except _CallProblem as problem:
+        return inconclusive_anomaly(task, problem.summary)
+    except httpx.TimeoutException:
+        return inconclusive_anomaly(task, "A análise de anomalia está indisponível. A conclusão fica inconclusiva.")
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code in (401, 403):
+            return inconclusive_anomaly(task, "A análise de anomalia foi recusada. A conclusão fica inconclusiva.")
+        return inconclusive_anomaly(task, "A análise de anomalia está indisponível. A conclusão fica inconclusiva.")
+    except httpx.HTTPError:
+        return inconclusive_anomaly(task, "A análise de anomalia está indisponível. A conclusão fica inconclusiva.")
+    except ValidationError:
+        return inconclusive_anomaly(
+            task,
+            "A análise de anomalia devolveu uma resposta inválida. A conclusão fica inconclusiva.",
+        )
+    except (ValueError, TypeError):
+        return inconclusive_anomaly(
+            task,
+            "A análise de anomalia devolveu uma resposta inválida. A conclusão fica inconclusiva.",
+        )
+
+
 def _parecer(
     trace_id: str,
     customer_id: str,
@@ -159,10 +328,41 @@ def _parecer(
     payments: SpecialistArtifact,
     reconciliation: SpecialistArtifact,
     anomaly: AnomalyArtifact,
+    deadline: Deadline,
 ) -> Parecer:
-    payment_status = _status_of(payments.data, "payment")
-    reconciliation_status = _status_of(reconciliation.data, "reconciliation")
-    answer = _compose_answer(customer_id, payments, reconciliation, anomaly, payment_status, reconciliation_status)
+    payments_outcome = technical_outcome(payments, customer_id, day)
+    reconciliation_outcome = technical_outcome(reconciliation, customer_id, day)
+    if payments_outcome != "completed" or reconciliation_outcome != "completed":
+        conclusion = "inconclusive"
+        codes: list[str] = []
+        explanation = (
+            f"A consulta de {customer_id} está inconclusiva: "
+            "a evidência foi recusada, está indisponível ou é inválida."
+        )
+    else:
+        conclusion = anomaly.conclusion
+        codes = list(anomaly.codes)
+        explanation = anomaly.explanation
+    payment_status = _status_of(payments, payments_outcome, "payment")
+    reconciliation_status = _status_of(reconciliation, reconciliation_outcome, "reconciliation")
+    answer = _compose_answer(
+        customer_id,
+        payments,
+        reconciliation,
+        payments_outcome,
+        reconciliation_outcome,
+        conclusion,
+        codes,
+        explanation,
+        payment_status,
+        reconciliation_status,
+        deadline,
+    )
+    sources: list[SourceRef] = []
+    if payments_outcome == "completed":
+        sources.append(SourceRef(domain="payments", source="replica", as_of=payments.as_of))
+    if reconciliation_outcome == "completed":
+        sources.append(SourceRef(domain="reconciliation", source="replica", as_of=reconciliation.as_of))
     return Parecer(
         trace_id=trace_id,
         customer_id=customer_id,
@@ -170,56 +370,64 @@ def _parecer(
         answer=answer,
         payments_status=payment_status,
         reconciliation_status=reconciliation_status,
-        payments_outcome=anomaly.payments_outcome,
-        reconciliation_outcome=anomaly.reconciliation_outcome,
-        conclusion=anomaly.conclusion,
-        anomaly=anomaly.conclusion == "divergence",
-        codes=list(anomaly.codes),
-        sources=[
-            SourceRef(domain="payments", source="replica", as_of=payments.as_of),
-            SourceRef(domain="reconciliation", source="replica", as_of=reconciliation.as_of),
-        ],
+        payments_outcome=payments_outcome,
+        reconciliation_outcome=reconciliation_outcome,
+        conclusion=conclusion,
+        anomaly=conclusion == "divergence",
+        codes=codes,
+        sources=sources,
     )
 
 
-def _status_of(data: dict | None, key: str) -> str | None:
-    if not data or not data.get("found"):
+def _status_of(artifact: SpecialistArtifact, outcome: str, key: str) -> str | None:
+    if outcome != "completed" or not isinstance(artifact.data, dict):
         return None
-    record = data.get(key) or {}
-    return record.get("status")
+    if not artifact.data.get("found"):
+        return None
+    record = artifact.data.get(key) or {}
+    status = record.get("status")
+    return status if isinstance(status, str) else None
 
 
 def _compose_answer(
     customer_id: str,
     payments: SpecialistArtifact,
     reconciliation: SpecialistArtifact,
-    anomaly: AnomalyArtifact,
+    payments_outcome: str,
+    reconciliation_outcome: str,
+    conclusion: str,
+    codes: list[str],
+    explanation: str,
     payment_status: str | None,
     reconciliation_status: str | None,
+    deadline: Deadline,
 ) -> str:
     parts = [
         f"Customer {customer_id}.",
-        payments.summary,
-        reconciliation.summary,
+        consultation_line("pagamentos", payments_outcome, payments),
+        consultation_line("conciliação", reconciliation_outcome, reconciliation),
     ]
     if payment_status:
         parts.append(f"Status de pagamento: {payment_status}.")
     if reconciliation_status:
         parts.append(f"Status de conciliação: {reconciliation_status}.")
-    if anomaly.conclusion == "divergence":
-        parts.append(f"Anomalia: {', '.join(anomaly.codes)}. {anomaly.explanation}")
+    if conclusion == "divergence":
+        parts.append(f"Anomalia: {', '.join(codes)}. {explanation}")
     else:
-        parts.append(anomaly.explanation)
+        parts.append(explanation)
     parts.append(REPLICA_WARNING)
     base = " ".join(part.strip() for part in parts if part)
-    prose = _model_prose(base)
+    prose = _model_prose(base, deadline)
     text = prose or base
     if REPLICA_WARNING not in text:
         text = f"{text} {REPLICA_WARNING}"
     return text
 
 
-def _model_prose(base: str) -> str | None:
+def _model_prose(base: str, deadline: Deadline) -> str | None:
+    budget = deadline.budget()
+    if budget is None:
+        return None
     return complete(
         ORCHESTRATOR_MODEL,
         (
@@ -227,7 +435,15 @@ def _model_prose(base: str) -> str | None:
             "sem inventar status, valor ou customer. Mantenha os identificadores."
         ),
         base,
+        timeout=min(MODEL_TIMEOUT_SECONDS, budget),
     )
+
+
+def _raise_for_status(response: httpx.Response, label: str) -> None:
+    if response.status_code in (401, 403):
+        raise _CallProblem("refused", f"{label} foi recusado.")
+    if response.status_code >= 400:
+        raise _CallProblem("unavailable", f"{label} está indisponível.")
 
 
 def default_business_date() -> date:
