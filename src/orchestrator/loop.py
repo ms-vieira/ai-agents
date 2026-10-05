@@ -1,5 +1,6 @@
 """O orquestrador escolhe o fluxo. O customer id sai da pergunta, não do texto da réplica."""
 
+import inspect
 import os
 import re
 import time
@@ -10,6 +11,7 @@ import httpx
 from pydantic import ValidationError
 
 from agents.evidence import (
+    accept_anomaly_artifact,
     consultation_line,
     inconclusive_anomaly,
     shareable_artifact,
@@ -40,6 +42,10 @@ from settings import (
 CUSTOMER_RE = re.compile(r"\bC-\d{4}\b")
 ORCHESTRATOR_MODEL = os.environ.get("ORCHESTRATOR_MODEL", "gpt-4.1")
 REPLICA_WARNING = "A leitura vem da réplica e pode estar atrás do processamento transacional."
+RETURN_MARGIN_SECONDS = 0.25
+MIN_OPERATION_SECONDS = 0.5
+
+
 def _call_floor() -> float:
     return min(AGENT_CALL_TIMEOUT_SECONDS, GATEWAY_CALL_TIMEOUT_SECONDS + 0.5)
 
@@ -50,8 +56,14 @@ class Deadline:
         self._end = clock() + seconds
         self._reserve = reserve
 
+    def now(self) -> float:
+        return self._clock()
+
+    def remaining(self) -> float:
+        return self._end - self.now() - self._reserve
+
     def budget(self) -> float | None:
-        available = self._end - self._clock() - self._reserve
+        available = self.remaining()
         if available < _call_floor():
             return None
         return available
@@ -94,34 +106,31 @@ class HttpAgentDirectory(AgentDirectory):
             "anomaly": "detect_anomaly",
         }
         self._default_timeout = AGENT_CALL_TIMEOUT_SECONDS if timeout is None else timeout
-        self._deadline: Deadline | None = None
         self._http = httpx.Client(timeout=self._default_timeout, transport=transport)
 
-    def bind_deadline(self, deadline: Deadline) -> None:
-        self._deadline = deadline
+    def payments(self, task: DomainTask, deadline: Deadline | None = None) -> SpecialistArtifact:
+        return self._domain("payments", task, deadline)
 
-    def payments(self, task: DomainTask) -> SpecialistArtifact:
-        return self._domain("payments", task)
+    def reconciliation(self, task: DomainTask, deadline: Deadline | None = None) -> SpecialistArtifact:
+        return self._domain("reconciliation", task, deadline)
 
-    def reconciliation(self, task: DomainTask) -> SpecialistArtifact:
-        return self._domain("reconciliation", task)
-
-    def anomaly(self, task: AnomalyTask) -> AnomalyArtifact:
+    def anomaly(self, task: AnomalyTask, deadline: Deadline | None = None) -> AnomalyArtifact:
         try:
-            payload = self._send("anomaly", task.model_dump(mode="json"))
+            payload = self._send("anomaly", task.model_dump(mode="json"), deadline)
         except _CallProblem as problem:
             return inconclusive_anomaly(task, problem.summary)
         try:
-            return AnomalyArtifact.model_validate(payload)
+            parsed = AnomalyArtifact.model_validate(payload)
         except ValidationError:
             return inconclusive_anomaly(
                 task,
                 "A análise de anomalia devolveu uma resposta inválida. A conclusão fica inconclusiva.",
             )
+        return accept_anomaly_artifact(parsed, task)
 
-    def _domain(self, name: str, task: DomainTask) -> SpecialistArtifact:
+    def _domain(self, name: str, task: DomainTask, deadline: Deadline | None) -> SpecialistArtifact:
         try:
-            payload = self._send(name, task.model_dump(mode="json"))
+            payload = self._send(name, task.model_dump(mode="json"), deadline)
         except _CallProblem as problem:
             return stopped_artifact(name, task, problem.status, problem.summary)
         try:
@@ -129,8 +138,13 @@ class HttpAgentDirectory(AgentDirectory):
         except ValidationError:
             return stopped_artifact(name, task, "invalid", "A consulta não produziu evidência utilizável.")
 
-    def _send(self, name: str, payload: dict) -> dict:
-        timeout = self._limit()
+    def _send(self, name: str, payload: dict, deadline: Deadline | None) -> dict:
+        call_end = self._call_end(deadline)
+        if call_end is None:
+            raise _CallProblem("unavailable", "A consulta não coube no prazo da investigação.")
+        timeout = self._operation_timeout(call_end, deadline)
+        if timeout is None:
+            raise _CallProblem("unavailable", "A consulta não coube no prazo da investigação.")
         base = self._urls[name]
         try:
             card = self._http.get(f"{base}/.well-known/agent-card.json", timeout=timeout)
@@ -147,8 +161,16 @@ class HttpAgentDirectory(AgentDirectory):
         skill_ids = [skill.get("id") for skill in skills if isinstance(skill, dict)]
         if self._skills[name] not in skill_ids:
             raise _CallProblem("invalid", "O cartão do agente não publica a skill esperada.")
+        timeout = self._operation_timeout(call_end, deadline)
+        if timeout is None:
+            raise _CallProblem("unavailable", "A consulta não coube no prazo da investigação.")
+        specialist_budget = timeout - RETURN_MARGIN_SECONDS
+        if specialist_budget <= 0:
+            raise _CallProblem("unavailable", "A consulta não coube no prazo da investigação.")
+        request_body = dict(payload)
+        request_body["timeout_seconds"] = specialist_budget
         try:
-            response = self._http.post(f"{base}/v1/tasks", json=payload, timeout=timeout)
+            response = self._http.post(f"{base}/v1/tasks", json=request_body, timeout=timeout)
         except httpx.TimeoutException as exc:
             raise _CallProblem("unavailable", "A consulta excedeu o prazo.") from exc
         except httpx.HTTPError as exc:
@@ -162,13 +184,22 @@ class HttpAgentDirectory(AgentDirectory):
             raise _CallProblem("invalid", "A consulta não produziu evidência utilizável.")
         return parsed
 
-    def _limit(self) -> float:
-        if self._deadline is None:
-            return self._default_timeout
-        budget = self._deadline.budget()
-        if budget is None:
-            raise _CallProblem("unavailable", "A consulta não coube no prazo da investigação.")
-        return min(self._default_timeout, budget)
+    def _call_end(self, deadline: Deadline | None) -> float | None:
+        if deadline is None:
+            return time.monotonic() + self._default_timeout
+        available = deadline.remaining()
+        if available < _call_floor():
+            return None
+        return deadline.now() + min(self._default_timeout, available)
+
+    def _operation_timeout(self, call_end: float, deadline: Deadline | None) -> float | None:
+        if deadline is None:
+            remaining = call_end - time.monotonic()
+        else:
+            remaining = min(call_end - deadline.now(), deadline.remaining())
+        if remaining < MIN_OPERATION_SECONDS:
+            return None
+        return remaining
 
     def close(self) -> None:
         self._http.close()
@@ -209,21 +240,19 @@ def answer_question(
         PARECER_RESERVE_SECONDS,
         clock,
     )
-    if hasattr(agents, "bind_deadline"):
-        agents.bind_deadline(deadline)
     payments_task = _domain_task(trace, "lookup_customer_processing", customer_id, day, question)
     reconciliation_task = _domain_task(
         trace, "lookup_customer_reconciliation", customer_id, day, question
     )
     payments = shareable_artifact(
         _invoke_domain(agents.payments, payments_task, deadline, "payments"),
-        customer_id,
-        day,
+        payments_task,
+        "payments",
     )
     reconciliation = shareable_artifact(
         _invoke_domain(agents.reconciliation, reconciliation_task, deadline, "reconciliation"),
-        customer_id,
-        day,
+        reconciliation_task,
+        "reconciliation",
     )
     anomaly_task = AnomalyTask(
         task_id=str(uuid.uuid4()),
@@ -272,7 +301,7 @@ def _invoke_domain(method, task: DomainTask, deadline: Deadline, agent_id: str) 
         return stopped_artifact(agent_id, task, "unavailable", "A consulta não coube no prazo da investigação.")
     task = task.model_copy(update={"timeout_seconds": min(budget, AGENT_CALL_TIMEOUT_SECONDS)})
     try:
-        return method(task)
+        return _call_agent(method, task, deadline)
     except _CallProblem as problem:
         return stopped_artifact(agent_id, task, problem.status, problem.summary)
     except httpx.TimeoutException:
@@ -298,7 +327,7 @@ def _invoke_anomaly(method, task: AnomalyTask, deadline: Deadline) -> AnomalyArt
         )
     task = task.model_copy(update={"timeout_seconds": min(budget, AGENT_CALL_TIMEOUT_SECONDS)})
     try:
-        return method(task)
+        artifact = _call_agent(method, task, deadline)
     except _CallProblem as problem:
         return inconclusive_anomaly(task, problem.summary)
     except httpx.TimeoutException:
@@ -319,6 +348,26 @@ def _invoke_anomaly(method, task: AnomalyTask, deadline: Deadline) -> AnomalyArt
             task,
             "A análise de anomalia devolveu uma resposta inválida. A conclusão fica inconclusiva.",
         )
+    return accept_anomaly_artifact(artifact, task)
+
+
+def _call_agent(method, task, deadline: Deadline):
+    if _accepts_deadline(method):
+        return method(task, deadline)
+    return method(task)
+
+
+def _accepts_deadline(method) -> bool:
+    try:
+        signature = inspect.signature(method)
+    except (TypeError, ValueError):
+        return False
+    if "deadline" in signature.parameters:
+        return True
+    return any(
+        parameter.kind in {inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD}
+        for parameter in signature.parameters.values()
+    )
 
 
 def _parecer(

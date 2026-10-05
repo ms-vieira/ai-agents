@@ -89,15 +89,21 @@ def _reconciliation(
     return data
 
 
-def _artifact(agent_id: str, data: dict | None, status: str = "completed", summary: str = "ok") -> SpecialistArtifact:
+def _artifact(
+    agent_id: str,
+    data: dict | None,
+    status: str = "completed",
+    summary: str = "ok",
+    task=None,
+) -> SpecialistArtifact:
     return SpecialistArtifact(
-        task_id="t",
-        trace_id="t",
+        task_id=task.task_id if task is not None else "t",
+        trace_id=task.trace_id if task is not None else "t",
         agent_id=agent_id,
         status=status,
         source="replica" if status == "completed" else None,
-        customer_id=CUSTOMER,
-        business_date=DAY,
+        customer_id=task.input.customer_id if task is not None else CUSTOMER,
+        business_date=task.input.business_date if task is not None else DAY,
         summary=summary,
         data=data,
     )
@@ -198,7 +204,7 @@ def test_outro_cliente_nao_aparece_no_parecer(tmp_path: Path, monkeypatch) -> No
             data = _reconciliation()
             data["customer_id"] = task.input.customer_id
             data["business_date"] = task.input.business_date.isoformat()
-            return _artifact("reconciliation", data, summary="Conciliação atualizada na réplica.")
+            return _artifact("reconciliation", data, summary="Conciliação atualizada na réplica.", task=task)
 
         def anomaly(self, task):
             body = task.model_dump_json()
@@ -346,7 +352,7 @@ def test_found_ausente_nao_entra_no_parecer(tmp_path: Path) -> None:
             data = _reconciliation()
             data["customer_id"] = task.input.customer_id
             data["business_date"] = task.input.business_date.isoformat()
-            return _artifact("reconciliation", data, summary="Conciliação atualizada na réplica.")
+            return _artifact("reconciliation", data, summary="Conciliação atualizada na réplica.", task=task)
 
         def anomaly(self, task):
             return run_anomaly_task(task)
@@ -413,7 +419,7 @@ def test_especialista_indisponivel_na_entrada_do_orquestrador(tmp_path: Path) ->
             data = _reconciliation()
             data["customer_id"] = task.input.customer_id
             data["business_date"] = task.input.business_date.isoformat()
-            return _artifact("reconciliation", data, summary="Conciliação atualizada na réplica.")
+            return _artifact("reconciliation", data, summary="Conciliação atualizada na réplica.", task=task)
 
         def anomaly(self, task):
             return run_anomaly_task(task)
@@ -491,13 +497,13 @@ def test_anomalia_indisponivel_nao_inventa_conclusao(tmp_path: Path) -> None:
             data = _payment(status="SUCCESS", amount_cents=150_000)
             data["customer_id"] = task.input.customer_id
             data["business_date"] = task.input.business_date.isoformat()
-            return _artifact("payments", data, summary="Pagamento com sucesso na réplica.")
+            return _artifact("payments", data, summary="Pagamento com sucesso na réplica.", task=task)
 
         def reconciliation(self, task):
             data = _reconciliation(status="ERROR", expected_amount_cents=150_000, settled_amount_cents=149_999)
             data["customer_id"] = task.input.customer_id
             data["business_date"] = task.input.business_date.isoformat()
-            return _artifact("reconciliation", data, summary="Conciliação em erro na réplica.")
+            return _artifact("reconciliation", data, summary="Conciliação em erro na réplica.", task=task)
 
         def anomaly(self, task):
             raise httpx.ConnectError("anomaly down")
@@ -550,13 +556,13 @@ def test_modelo_fora_do_prazo_nao_e_chamado(tmp_path: Path, monkeypatch) -> None
             data = _payment()
             data["customer_id"] = task.input.customer_id
             data["business_date"] = task.input.business_date.isoformat()
-            return _artifact("payments", data, summary="Pagamento com sucesso na réplica.")
+            return _artifact("payments", data, summary="Pagamento com sucesso na réplica.", task=task)
 
         def reconciliation(self, task):
             data = _reconciliation()
             data["customer_id"] = task.input.customer_id
             data["business_date"] = task.input.business_date.isoformat()
-            return _artifact("reconciliation", data, summary="Conciliação atualizada na réplica.")
+            return _artifact("reconciliation", data, summary="Conciliação atualizada na réplica.", task=task)
 
         def anomaly(self, task):
             clock.now = 1_000.0

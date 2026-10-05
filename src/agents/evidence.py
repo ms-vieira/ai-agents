@@ -217,17 +217,17 @@ def consultation_line(label: str, outcome: str, artifact: SpecialistArtifact) ->
     return f"A consulta de {label} não produziu evidência utilizável."
 
 
-def shareable_artifact(
-    artifact: SpecialistArtifact,
-    customer_id: str,
-    business_date: date,
-) -> SpecialistArtifact:
-    """Drop payload, status, and summary unless the envelope matches the task."""
-    outcome = technical_outcome(artifact, customer_id, business_date)
+def shareable_artifact(artifact: SpecialistArtifact, task: DomainTask, expected_agent_id: str) -> SpecialistArtifact:
+    """Keep the artifact only when its envelope and payload belong to this task."""
+    if not _envelope_matches(artifact, task, expected_agent_id) or not _internal_matches_envelope(
+        artifact, expected_agent_id
+    ):
+        return stopped_artifact(expected_agent_id, task, "invalid", "A consulta não produziu evidência utilizável.")
+    outcome = technical_outcome(artifact, task.input.customer_id, task.input.business_date)
     if outcome == "completed":
         return artifact
     status: SpecialistStatus = outcome if outcome in {"refused", "unavailable", "invalid"} else "invalid"
-    label = "pagamentos" if artifact.agent_id == "payments" else "conciliação"
+    label = "pagamentos" if expected_agent_id == "payments" else "conciliação"
     return artifact.model_copy(
         update={
             "status": status,
@@ -237,6 +237,63 @@ def shareable_artifact(
             "data": None,
         }
     )
+
+
+def accept_anomaly_artifact(artifact: AnomalyArtifact, task: AnomalyTask) -> AnomalyArtifact:
+    """Drop a conclusion that does not belong to this anomaly task."""
+    if _anomaly_matches(artifact, task):
+        return artifact
+    return inconclusive_anomaly(
+        task,
+        "A análise de anomalia devolveu uma resposta inválida. A conclusão fica inconclusiva.",
+    )
+
+
+def _envelope_matches(artifact: SpecialistArtifact, task: DomainTask, expected_agent_id: str) -> bool:
+    return (
+        artifact.task_id == task.task_id
+        and artifact.trace_id == task.trace_id
+        and artifact.agent_id == expected_agent_id
+        and artifact.customer_id == task.input.customer_id
+        and artifact.business_date == task.input.business_date
+    )
+
+
+def _internal_matches_envelope(artifact: SpecialistArtifact, expected_agent_id: str) -> bool:
+    if artifact.data is None:
+        return artifact.status != "completed"
+    parsed = parse_for_agent(expected_agent_id, artifact.data)
+    if parsed is None:
+        return False
+    return parsed.customer_id == artifact.customer_id and parsed.business_date == artifact.business_date
+
+
+def _anomaly_matches(artifact: AnomalyArtifact, task: AnomalyTask) -> bool:
+    if artifact.task_id != task.task_id or artifact.trace_id != task.trace_id:
+        return False
+    if artifact.agent_id != "anomaly":
+        return False
+    if artifact.customer_id != task.customer_id or artifact.business_date != task.business_date:
+        return False
+    payments_outcome = technical_outcome(task.payments, task.customer_id, task.business_date)
+    reconciliation_outcome = technical_outcome(task.reconciliation, task.customer_id, task.business_date)
+    if artifact.payments_outcome != payments_outcome or artifact.reconciliation_outcome != reconciliation_outcome:
+        return False
+    if artifact.conclusion == "divergence":
+        return (
+            artifact.anomaly
+            and bool(artifact.codes)
+            and payments_outcome == "completed"
+            and reconciliation_outcome == "completed"
+        )
+    if artifact.conclusion == "no_divergence":
+        return (
+            not artifact.anomaly
+            and not artifact.codes
+            and payments_outcome == "completed"
+            and reconciliation_outcome == "completed"
+        )
+    return artifact.conclusion == "inconclusive" and not artifact.anomaly and not artifact.codes
 
 
 def _parse(model, data: dict | None):

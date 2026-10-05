@@ -27,6 +27,26 @@ A specialist consultation and the business conclusion are different fields.
 
 `SpecialistStatus` includes `invalid` for a consultation that stopped before a summary was built. `DomainTask` and `AnomalyTask` accept an optional `timeout_seconds`, the remaining budget for that call.
 
+## Specialist envelopes
+
+A specialist response is evidence only when the whole envelope belongs to the task that was sent. Before the artifact is shared, summarized, or sent to a model, it is compared with that task:
+
+| Field | Must equal |
+| --- | --- |
+| `task_id` | The domain task id |
+| `trace_id` | The investigation trace |
+| `agent_id` | The specialist that was called |
+| `customer_id` | The customer on the task |
+| `business_date` | The business date on the task |
+
+The read payload must also match that envelope: its `customer_id` and `business_date` are the envelope's, and it must satisfy the read contract below. A mismatch is `invalid`. The foreign data, summary, and source reference are discarded. The other domain's valid evidence stays. The response identifiers are not rewritten so the foreign body can pass as this task.
+
+## Anomaly response
+
+`AnomalyArtifact` must belong to the `AnomalyTask` that was sent: same `task_id`, `trace_id`, `agent_id` (`anomaly`), `customer_id`, and `business_date`. `payments_outcome` and `reconciliation_outcome` must be the outcomes of the evidence that was forwarded. `conclusion`, `anomaly`, and `codes` must agree: `divergence` carries `anomaly: true` and at least one code; `no_divergence` and `inconclusive` carry `anomaly: false` and no codes. `divergence` and `no_divergence` also require both forwarded consultations to be `completed`.
+
+A response that fails this check is discarded. The investigation stays `inconclusive`. Valid domain summaries remain. A `no_divergence` from another investigation does not become this investigation's conclusion.
+
 ## Read envelopes
 
 `PaymentReadResponse` and `ReconciliationReadResponse` are validated before any summary or model call. The payload must include `source`, `as_of`, `found`, `customer_id`, and `business_date`. Amounts are non-negative integers. Status values must be the known literals.
@@ -78,9 +98,15 @@ If the anomaly specialist is unavailable, times out, or returns a body that is n
 
 ## Deadlines
 
-The investigation has one budget, `INVESTIGATION_DEADLINE_SECONDS` (default 16). `PARECER_RESERVE_SECONDS` (default 1) is kept for composing and returning the parecer. A call starts only when the remaining time, after that reserve, covers the gateway timeout plus a short margin (`GATEWAY_CALL_TIMEOUT_SECONDS`, default 2).
+Each investigation builds its own `Deadline`. The shared HTTP client does not store that deadline. Two investigations can use the same directory without changing each other's remaining time.
 
-Each specialist HTTP call waits at most `AGENT_CALL_TIMEOUT_SECONDS` (default 5), or less when that is all the budget left. The tool call and the model call are both capped inside that same wait: a slow model cannot outlive the orchestrator and discard evidence that was already read. `MODEL_TIMEOUT_SECONDS` (default 2) is only the upper bound. There is no automatic retry. When the model fails or does not fit, the answer stays on the deterministic text.
+`INVESTIGATION_DEADLINE_SECONDS` (default 16) is the whole investigation. `PARECER_RESERVE_SECONDS` (default 1) stays unused until the parecer is composed. A specialist call starts only when the time left, after that reserve, covers the call floor (the gateway timeout plus a short margin, and never more than `AGENT_CALL_TIMEOUT_SECONDS`, default 5).
+
+The call window is fixed when the call starts. It is the smaller of the specialist limit and the investigation time still left. Fetching the Agent Card spends that window. Before the task POST, the clock is read again. The POST is not started when the remaining time is below half a second. The `timeout_seconds` sent to the specialist is that remaining time minus a 0.25s margin, so the specialist can still return. The card request does not refresh the window.
+
+httpx applies a float `timeout` separately to connect, read, write, and pool. That number is not a wall-clock cap on the whole request: each phase may use up to that long, and the read timeout is the wait for the next response chunk. The limits this service actually enforces are the deadline checks before a request is started. The httpx value only bounds one phase of that request. There is no automatic retry.
+
+Inside the specialist, the tool call and the model call are split from `timeout_seconds`. `MODEL_TIMEOUT_SECONDS` (default 2) is only an upper bound. When the model fails or does not fit, the answer stays on the deterministic text.
 
 ## Gateway decisions
 
