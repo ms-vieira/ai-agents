@@ -7,7 +7,7 @@ from fastapi import FastAPI, Header, HTTPException
 from contracts.manifest import read_manifest
 from contracts.models import GatewayCall, GatewayResult
 from gateway.mcp_client import call_mcp_tool_sync
-from gateway.policy import GatewayPolicy
+from gateway.policy import GatewayPolicy, audit_authentication_refusal
 from settings import (
     AGENT_TOKENS,
     GATEWAY_PORT,
@@ -69,7 +69,12 @@ def call_tool(
     body: GatewayCall,
     authorization: str | None = Header(default=None),
 ) -> GatewayResult:
-    agent_id = _bearer(authorization)
+    try:
+        agent_id = _bearer(authorization)
+    except HTTPException as exc:
+        if exc.status_code == 401:
+            audit_authentication_refusal(AUDIT_PATH, body)
+        raise
     status, result = _policy_for_manifest().handle(agent_id, body, _downstream)
     if status != 200:
         raise HTTPException(status_code=status, detail=result.model_dump(mode="json"))

@@ -42,7 +42,7 @@ flowchart LR
 
 `commands/serve.py` and `commands/run_demo.py` call `load_session` in `app-payments/load.py`. That draws three customers, writes both replicas, and saves `var/session.json`. The orchestrator and the gateway read that file through `src/contracts/manifest.py`.
 
-Without `OPENAI_API_KEY`, the answer text is filled from the replica JSON. With a key, `ORCHESTRATOR_MODEL` rewrites the orchestrator prose and `SPECIALIST_MODEL` rewrites the specialist summaries. Status fields still come from the replica.
+Without `OPENAI_API_KEY`, the answer text is filled from the replica JSON. With a key, `ORCHESTRATOR_MODEL` rewrites the orchestrator prose and `SPECIALIST_MODEL` rewrites the specialist summaries. Status fields still come from a validated replica envelope. Each question has its own deadline (`INVESTIGATION_DEADLINE_SECONDS`, default 16). Time is split across the specialist calls, with one second held back to return the parecer. A specialist response counts only when its envelope belongs to that question. If the model is slow or the provider fails, the answer stays on the deterministic text. The field rules are in [src/contracts/README.md](src/contracts/README.md).
 
 ## Layout
 
@@ -55,7 +55,7 @@ Without `OPENAI_API_KEY`, the answer text is filled from the replica JSON. With 
 | `src/gateway/` | Allowlist, rate limit, call budget, redaction, audit log |
 | `src/agents/` | `payments`, `reconciliation`, and `anomaly` |
 | `src/orchestrator/` | Catalog, refusal, and the parecer |
-| `src/contracts/` | Shared JSON. Includes the manifest reader |
+| `src/contracts/` | Shared JSON. The parecer separates technical outcome from the business conclusion. See [src/contracts/README.md](src/contracts/README.md). |
 | `src/replica/` | Read routes used by both apps |
 | `tests/` | Permissions, replica, rate limit, and redaction, with no model call |
 | `article/article.md` | Portuguese walkthrough of the same path |
