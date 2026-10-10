@@ -116,8 +116,10 @@ These address important failure modes. Their implementation and regression tests
 - Keep application endpoint names, identifiers, and Portuguese runtime behavior unchanged.
 - Correct the README's implication that copying `.env.example` automatically loads configuration.
 - Describe prototype limitations without presenting them as enterprise guarantees.
+- Give the English article its own diagram, `architecture.png`. The Portuguese article keeps `arquitetura-agentes-ia.png`.
+- State in the Portuguese article that a tool failure does not consume the per-task call budget.
 
-The existing PNG is retained; its visual content and language were not verified.
+The English diagram uses the same layout as the Portuguese one: blue for agents, pink for the gateway and MCP servers, green for the APIs and databases. Specialist-to-gateway arrows are HTTP. MCP starts at the gateway.
 
 ## Recommended delivery order
 

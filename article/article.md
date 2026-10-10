@@ -34,9 +34,9 @@ We implement coordination directly in code to make those responsibilities visibl
 
 ### How the components connect
 
-![AI agent architecture showing the orchestrator, specialists, gateway, MCP servers, read APIs, and databases](arquitetura-agentes-ia.png)
+![AI agent architecture showing the orchestrator, specialists, gateway, MCP servers, read APIs, and databases](architecture.png)
 
-*Figure 1 — The investigation spans agent coordination, a tool gateway, domain MCP servers, and read APIs. The protocol boundaries are explained below.*
+*Figure 1 — Blue represents the agents and orchestration; pink, the gateway and MCP servers; green, the APIs and databases. Arrows name the protocol of each call: HTTP between the orchestrator, the specialists, and the gateway; MCP from the gateway to the tool servers.*
 
 **A2A (Agent2Agent)** defines communication between agents. This project uses the SDK to publish **Agent Cards**, which describe specialist capabilities. The orchestrator reads those cards, but submits tasks through a custom HTTP endpoint, `/v1/tasks`. This is not a complete implementation of the A2A task execution protocol.
 

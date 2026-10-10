@@ -80,7 +80,9 @@ São controles específicos do exemplo. Eles não comprovam proteção contra qu
 
 ### Como acompanhar a execução
 
-O gateway aplica **rate limit** e registra decisões. O limitador tem capacidade de cinco chamadas por agent e tool, com reposição ao longo de 60 segundos, além do teto configurado de três chamadas por tarefa.
+O gateway aplica **rate limit** e registra decisões. O limitador tem capacidade de cinco chamadas por agent e tool, com reposição ao longo de 60 segundos, além do teto de três chamadas por tarefa e por agent.
+
+Esse teto conta as chamadas concluídas e os replays em cache. Uma falha da tool não consome a cota. Os contadores ficam na memória do processo, então duas chamadas ao mesmo tempo podem ultrapassar o teto. Em produção, a contagem precisa ser atômica, com retenção limitada e uma regra explícita para falha e para mais de uma instância.
 
 Os logs incluem agent, tool, cliente e decisão. O `trace_id` permite relacionar a investigação às chamadas realizadas.
 
