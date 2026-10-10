@@ -1,8 +1,10 @@
 # ai-agents
 
-Runnable example of one orchestrator and three specialist agents. An operator asks, in Portuguese, whether a customer was processed today, how reconciliation looks, and whether there is an anomaly. The orchestrator uses the more capable model. The specialists use the cheaper model. A tool call crosses the MCP gateway, and every read comes from a replica.
+Runnable example of one orchestrator and three specialist agents. An operator asks, in Portuguese, whether a customer was processed on the session business date, how reconciliation looks, and whether there is an anomaly. The orchestrator uses the more capable model. The specialists use the cheaper model. A tool call crosses the MCP gateway, and every read comes from a replica.
 
-The article is in Portuguese: [article/article.md](article/article.md). Folder names, protocols, and these READMEs are in English.
+Read the English article: [article/article.md](article/article.md). The original Portuguese text is preserved in [article/article.pt-BR.md](article/article.pt-BR.md). Application prompts and responses remain in Portuguese; documentation translation does not change runtime behavior.
+
+See [the repository review](article/repository-review.md) for implementation findings, enterprise readiness gaps, and validation limits.
 
 ## Responsibility
 
@@ -42,7 +44,7 @@ flowchart LR
 
 `commands/serve.py` and `commands/run_demo.py` call `load_session` in `app-payments/load.py`. That draws three customers, writes both replicas, and saves `var/session.json`. The orchestrator and the gateway read that file through `src/contracts/manifest.py`.
 
-Without `OPENAI_API_KEY`, the answer text is filled from the replica JSON. With a key, `ORCHESTRATOR_MODEL` rewrites the orchestrator prose and `SPECIALIST_MODEL` rewrites the specialist summaries. Status fields still come from a validated replica envelope. Each question has its own deadline (`INVESTIGATION_DEADLINE_SECONDS`, default 16). Time is split across the specialist calls, with one second held back to return the parecer. A specialist response counts only when its envelope belongs to that question. If the model is slow or the provider fails, the answer stays on the deterministic text. The field rules are in [src/contracts/README.md](src/contracts/README.md).
+Without `OPENAI_API_KEY`, the answer text is filled from the replica JSON. With a key, `ORCHESTRATOR_MODEL` rewrites the orchestrator prose and `SPECIALIST_MODEL` rewrites the specialist summaries. Status fields still come from a validated replica envelope. Each question has its own deadline (`INVESTIGATION_DEADLINE_SECONDS`, default 16). Time is split across the specialist calls, with one second held back to return the investigation report. A specialist response counts only when its envelope belongs to that question. If the model is slow or the provider fails, the answer stays on the deterministic text. The field rules are in [src/contracts/README.md](src/contracts/README.md).
 
 ## Layout
 
@@ -54,11 +56,11 @@ Without `OPENAI_API_KEY`, the answer text is filled from the replica JSON. With 
 | `src/mcp_servers/` | One MCP server per domain: `get_processing`, `get_reconciliation` |
 | `src/gateway/` | Allowlist, rate limit, call budget, redaction, audit log |
 | `src/agents/` | `payments`, `reconciliation`, and `anomaly` |
-| `src/orchestrator/` | Catalog, refusal, and the parecer |
-| `src/contracts/` | Shared JSON. The parecer separates technical outcome from the business conclusion. See [src/contracts/README.md](src/contracts/README.md). |
+| `src/orchestrator/` | Catalog, refusal, and the investigation report |
+| `src/contracts/` | Shared JSON. The investigation report separates technical outcome from the business conclusion. See [src/contracts/README.md](src/contracts/README.md). |
 | `src/replica/` | Read routes used by both apps |
 | `tests/` | Permissions, replica, rate limit, and redaction, with no model call |
-| `article/article.md` | Portuguese walkthrough of the same path |
+| `article/article.md` | English walkthrough of the same path |
 
 `var/`, `.venv/`, and `.env` are created locally and stay out of Git.
 
@@ -92,4 +94,4 @@ After it prints `up at http://127.0.0.1:8500`:
 .venv/bin/python commands/ask.py
 ```
 
-Variable names are in `.env.example`. Copy it to `.env` when you want a model to rewrite the prose.
+Variable names are in `.env.example`. To enable LLM-generated prose, export `OPENAI_API_KEY` in the environment used to start the services, then restart them. The scripts do not automatically load `.env`; copying the example alone has no effect.
